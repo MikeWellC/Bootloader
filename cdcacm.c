@@ -27,6 +27,7 @@
 /**
  * @file cdcacm.c
  * @author Gareth McMullin <gareth@blacksphere.co.nz>
+ * @author David Sidrane <david_s5@nscdg.com>
  */
 #include "hw_config.h"
 
@@ -35,22 +36,33 @@
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/gpio.h>
 #include <libopencm3/stm32/flash.h>
+#include <libopencm3/stm32/otg_fs.h>
 
+#include <libopencm3/cm3/systick.h>
 #include <libopencm3/cm3/nvic.h>
 #include <libopencm3/usb/usbd.h>
 #include <libopencm3/usb/cdc.h>
 
 #include "bl.h"
-
+#if INTERFACE_USB != 0
 #define USB_CDC_REQ_GET_LINE_CODING			0x21 // Not defined in libopencm3
 
+/*
+ * ST changed the meaning and sense of a few critical bits
+ * in the USB IP block identified as 0x00002000
+ * libopencm3 has failed to merge my PR to fix this
+ * So the the following are defined to fix the issue
+ * herein.
+ */
+#define OTG_CID_HAS_VBDEN 0x00002000
+#define OTG_GCCFG_VBDEN   (1 << 21)
 
 /* Provide the stings for the Index 1-n as a requested index of 0 is used for the supported langages
  *  and is hard coded in the usb lib. The array below is indexed by requested index-1, therefore
  *  element[0] maps to requested index 1
  */
 static const char *usb_strings[] = {
-	"3D Robotics", /* Maps to Index 1 Index */
+	USBMFGSTRING, /* Maps to Index 1 Index */
 	USBDEVICESTRING,
 	"0",
 };
@@ -69,7 +81,7 @@ static const struct usb_device_descriptor dev = {
 	.bDeviceSubClass = 0,
 	.bDeviceProtocol = 0,
 	.bMaxPacketSize0 = 64,
-	.idVendor = 0x26AC,					/**< Vendor ID (VID) */
+	.idVendor = USBVENDORID,			/**< Vendor ID (VID) */
 	.idProduct = USBPRODUCTID,			/**< Product ID (PID) */
 	.bcdDevice = 0x0101,				/**< Product version. Set to 1.01 (0x0101) to agree with NuttX */
 	.iManufacturer = 1,					/**< Use string with index 1 for the manufacturer string ("3D Robotics") */
@@ -284,10 +296,27 @@ usb_cinit(void)
 	rcc_peripheral_enable_clock(&RCC_AHB1ENR, RCC_AHB1ENR_IOPAEN);
 	rcc_peripheral_enable_clock(&RCC_AHB2ENR, RCC_AHB2ENR_OTGFSEN);
 
-	/* Configure to use the Alternate IO Functions USB DP,DM and VBUS */
+#if defined(USB_FORCE_DISCONNECT)
+	gpio_mode_setup(GPIOA, GPIO_MODE_OUTPUT, GPIO_OTYPE_OD, GPIO12);
+	gpio_set_output_options(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO12);
+	gpio_clear(GPIOA, GPIO12);
+	systick_set_clocksource(STK_CSR_CLKSOURCE_AHB);
+	systick_set_reload(board_info.systick_mhz * 1000);	/* 1ms tick, magic number */
+	systick_interrupt_enable();
+	systick_counter_enable();
+	/* Spec is 2-2.5 uS */
+	delay(1);
+	systick_interrupt_disable();
+	systick_counter_disable(); // Stop the timer
+#endif
+	/* Configure to use the Alternate IO Functions USB DP,DM */
 
-	gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO9 | GPIO11 | GPIO12);
-	gpio_set_af(GPIOA, GPIO_AF10, GPIO9 | GPIO11 | GPIO12);
+	gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO11 | GPIO12);
+	gpio_set_af(GPIOA, GPIO_AF10, GPIO11 | GPIO12);
+
+#if defined(BOARD_USB_VBUS_SENSE_DISABLED)
+	OTG_FS_GCCFG |= OTG_GCCFG_NOVBUSSENS;
+#endif
 
 	usbd_dev = usbd_init(&otgfs_usb_driver, &dev, &config, usb_strings, NUM_USB_STRINGS,
 			     usbd_control_buffer, sizeof(usbd_control_buffer));
@@ -297,13 +326,23 @@ usb_cinit(void)
 	gpio_set(GPIOA, GPIO8);
 	gpio_set_mode(GPIOA, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, GPIO8);
 
-	usbd_dev = usbd_init(&stm32f103_usb_driver, &dev, &config, usb_strings, NUM_USB_STRINGS,
+	usbd_dev = usbd_init(&st_usbfs_v1_usb_driver, &dev, &config, usb_strings, NUM_USB_STRINGS,
 			     usbd_control_buffer, sizeof(usbd_control_buffer));
 #endif
 
 	usbd_register_set_config_callback(usbd_dev, cdcacm_set_config);
 
 #if defined(STM32F4)
+
+	if (OTG_FS_CID == OTG_CID_HAS_VBDEN) {
+
+		OTG_FS_GCCFG |= OTG_GCCFG_VBDEN | OTG_GCCFG_PWRDWN;
+
+		/* Set the Soft Connect (STMF32446, STMF32469 comes up disconnected) */
+
+		OTG_FS_DCTL &= ~OTG_DCTL_SDIS;
+	}
+
 	nvic_enable_irq(NVIC_OTG_FS_IRQ);
 #endif
 }
@@ -322,7 +361,7 @@ usb_cfini(void)
 
 #if defined(STM32F4)
 	/* Reset the USB pins to being floating inputs */
-	gpio_mode_setup(GPIOA, GPIO_MODE_INPUT, GPIO_PUPD_NONE, GPIO9 | GPIO11 | GPIO12);
+	gpio_mode_setup(GPIOA, GPIO_MODE_INPUT, GPIO_PUPD_NONE, GPIO11 | GPIO12);
 
 	/* Disable the OTGFS peripheral clock */
 	rcc_peripheral_disable_clock(&RCC_AHB2ENR, RCC_AHB2ENR_OTGFSEN);
@@ -360,3 +399,4 @@ usb_cout(uint8_t *buf, unsigned count)
 		}
 	}
 }
+#endif
